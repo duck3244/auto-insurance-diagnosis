@@ -1,0 +1,25 @@
+# 핀 기준: 현재 검증 환경(Python 3.11). 재현성을 위해 핵심 패키지 고정.
+# 업그레이드 시 scripts/*.py 와 tests 전체를 재실행해 결과 회귀 확인.
+# core
+pandas==2.3.3
+numpy==2.4.6
+scikit-learn==1.8.0
+scipy==1.17.1
+statsmodels==0.14.6     # GLM (Poisson/Gamma/Tweedie)
+# gradient boosting
+lightgbm==4.6.0
+xgboost==3.2.0
+# interpretability
+shap==0.51.0
+# evaluation / calibration
+matplotlib==3.10.9
+# app (M5)
+fastapi==0.125.0
+uvicorn==0.24.0
+streamlit==1.28.2
+httpx==0.28.1           # FastAPI TestClient
+joblib==1.5.3           # 엔진 직렬화
+# config / utils
+pyyaml==6.0.2
+python-dotenv==1.0.0    # .env 에서 API 키 로드
+requests==2.32.4        # KOSIS OpenAPI 호출

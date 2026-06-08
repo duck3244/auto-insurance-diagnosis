@@ -1,0 +1,170 @@
+# auto-insurance-diagnosis configuration
+
+# 외부 API (키 자체는 여기 두지 말 것 — .env 에 저장, 여기엔 '환경변수 이름'만)
+apis:
+  kosis:
+    api_key_env: KOSIS_API_KEY        # 실제 키는 .env 의 KOSIS_API_KEY 에 저장
+    base_url: https://kosis.kr/openapi/Param/statisticsParameterData.do
+    reference_year: "2024"              # 한국 마진 공통 최신연도(면허 2024가 최신 → 차량도 2024로 통일)
+    tables:
+      vehicle_registration:             # 자동차등록대수현황(차종·용도)
+        orgId: "116"
+        tblId: DT_MLTM_1244
+      license_age:                      # 운전면허소지자 연령별(C2=면허종, C1=연령)
+        orgId: "132"
+        tblId: DT_13201_A002
+      license_gender:                   # 운전면허소지자 성별(C1=면허종, C2=계/남자/여자)
+        orgId: "132"
+        tblId: DT_13201_A004
+
+data:
+  # --- 메인: freMTPL2 (빈도×심도→순보험료) ---
+  freq_path: data/raw/freMTPL2freq.csv
+  sev_path: data/raw/freMTPL2sev.csv
+  id_col: IDpol
+  exposure_col: Exposure
+  claim_count_col: ClaimNb
+  claim_amount_col: ClaimAmount
+
+# 보조 데이터셋 (선택 트랙) — 조사 후 보강 2026-06-07
+auxiliary_data:
+  # 공정성 트랙: 성별 보유 → discrimination-free pricing 실증 (freMTPL2의 성별 부재 보완)
+  ausprivauto:
+    path: data/raw/ausprivauto0405.csv     # Kaggle "dataCar" / CASdatasets ausprivauto0405
+    target_freq: ClaimNb
+    target_sev: ClaimAmount
+    exposure_col: Exposure
+    sensitive_col: Gender                   # 공정성 평가용 민감변수
+    source: https://www.kaggle.com/datasets/karangadiya/insurance
+  # 차별화(선택): 주행행동 기반 진단
+  synthetic_telematics:
+    path: data/raw/synthetic_telematics.csv  # So·Boucher·Valdez 2021 (UConn 공개)
+    sensitive_col: Insured.sex
+    source: https://emiliano-valdez.scholar.uconn.edu/data/
+  # 이진 트랙: 청구확률
+  porto_seguro:
+    path: data/raw/porto_seguro_train.csv
+    target: target
+    source: https://www.kaggle.com/competitions/porto-seguro-safe-driver-prediction
+  # (제한적) 대규모 심도회귀 — 완전 익명화로 해석 불가
+  allstate_severity:
+    path: data/raw/allstate_train.csv
+    target: loss
+    source: https://www.kaggle.com/competitions/allstate-claims-severity
+
+# 공정성 평가 설정 (보조 트랙용)
+fairness:
+  method: discrimination_free_pricing   # Lindholm·Richman·Tsanakas·Wüthrich
+  sensitive_attribute: Gender           # ausprivauto 기준
+  note: freMTPL2엔 성별 없음 → ausprivauto/synthetic_telematics로 실증
+
+preprocess:
+  cap_claim_nb: 4        # ClaimNb 상한 (데이터 오류 의심)
+  cap_exposure: 1.0      # Exposure 상한
+  drop_orphan_claims: true   # freq에 대응 정책 없는 sev 레코드 제거
+  severity_clip_quantile: 0.995   # 심도 대형 outlier 상한
+
+split:
+  strategy: group        # policy(IDpol) 단위 그룹 분할 — row 누수 방지
+  test_size: 0.2
+  n_folds: 5
+  seed: 42
+
+model:
+  frequency:
+    family: poisson      # offset = log(Exposure)
+    type: lightgbm       # glm | lightgbm
+  severity:
+    family: gamma        # claim 건수 가중
+    type: lightgbm
+  pure_premium:
+    family: tweedie
+    tweedie_power_grid: [1.5, 1.6, 1.7, 1.8, 1.9]
+
+evaluation:
+  metrics: [poisson_deviance, gamma_deviance, tweedie_deviance, gini, lift]
+  calibration:
+    check_auto_calibration: true
+    recalibration: isotonic   # GBM 후처리 재보정
+  # 공정성 완화: 그룹별 balance 동시 보장 (multicalibration)
+  multicalibration:
+    enabled: false
+    groups: [Gender]          # 보조 데이터(ausprivauto) 기준
+
+diagnosis:
+  premium_percentiles: [10, 30, 50, 70, 90]
+  # 리스크 백분위 → 권장 자기부담금/담보 한도 매핑 룰은 diagnosis/rules.py 참조
+  # 순보험료(리스크 원가) → 상용보험료 grossing-up: gross = pure / (1 - expense_ratio - profit_margin)
+  loading:
+    expense_ratio: 0.25       # 사업비율 (예시 — 시장 기준으로 보정 필요)
+    profit_margin: 0.05       # 이익마진율
+
+# --- 리스크 완화 (§8.1) ---
+mitigation:
+  # 도메인 시프트(佛→韓): 구조 재사용 후 target baseline 재보정
+  domain_shift:
+    strategy: recalibration   # recalibration | importance_weighting | finetune
+    monitor_drift: true
+  # 한국 집계통계 → 마진 캘리브레이션 (Raking / IPF)
+  raking:
+    enabled: true
+    max_iter: 50
+    tol: 1.0e-6
+    # 데이터셋별 컬럼 매핑: 어떤 마진을, 어떤 컬럼을 어떻게 변환해 적용할지.
+    #   transform: age_band(연속나이→밴드) | value_map(값치환) | identity
+    datasets:
+      fremtpl2:               # ★성별 컬럼 없음 → DrivAge(연속)만 적용
+        margins: [DrivAge]
+        columns:
+          DrivAge: {source: DrivAge, transform: age_band}
+      ausprivauto:            # 성별 보유 → Gender + 연령(밴드 보유 시 매핑)
+        margins: [Gender]
+        columns:
+          Gender:
+            source: Gender
+            transform: value_map
+            map: {Male: Male, Female: Female, M: Male, F: Female}
+    # target_margins: rake()에 직접 넣는 {데이터셋 컬럼: {범주: 비율}}.
+    #   ★ 연도 통일=2024 (KOSIS, 공통 최신연도). 재현: python -m auto_insurance.calibration.kosis
+    #   (freMTPL2엔 Gender 없음 → Gender는 ausprivauto 트랙에만 적용)
+    reference_year: 2024
+    # ★ 수치 단일 정의(SSOT): 앵커(&)로 정의 → korea_reference_margins 가 병합키(<<)로 재사용.
+    target_margins:
+      Gender: &gender_2024    # 운전면허 소지자 성별 (KOSIS DT_13201_A004, 2024) — ausprivauto 대상
+        Male: 0.566
+        Female: 0.434
+      DrivAge: &drivage_2024  # 운전면허 소지자 연령대 분포 (KOSIS DT_13201_A002, 2024)
+        "<20": 0.007
+        "20s": 0.130
+        "30s": 0.179
+        "40s": 0.209
+        "50s": 0.226
+        "60s": 0.177
+        "70+": 0.072
+    # 한국 공개 집계 실측값 (출처·연도 명시) — 매핑 전 원천 데이터
+    korea_reference_margins:
+      # 전 마진 KOSIS 2024 통일. 재현: python -m auto_insurance.calibration.kosis (키는 .env)
+      gender_license_2024:    # 운전면허 소지자 성별 (총 34,707,289 = 남 19,640,954/여 15,066,335)
+        <<: *gender_2024      # ↑ target_margins.Gender 와 동일 수치 재사용(SSOT)
+        source: KOSIS 운전면허소지자현황(성별) DT_13201_A004 (orgId 132) 2024
+      driver_age_2024:        # 운전면허 소지자 연령대 분포 (총 34,707,289, C2=총계)
+        <<: *drivage_2024     # ↑ target_margins.DrivAge 와 동일 수치 재사용(SSOT)
+        source: KOSIS 운전면허소지자현황(연령별) DT_13201_A002 (orgId 132) 2024
+      vehicle_type_2024:      # 차종별 (전 용도 합산, 총 26,297,919대)
+        승용: 0.8279
+        승합: 0.0253
+        화물: 0.1413
+        특수: 0.0055
+        source: KOSIS 자동차등록대수현황 DT_MLTM_1244 (orgId 116) 2024
+      passenger_use_2024:     # 승용차 용도별 (보험 핵심: 자가용/영업용) — 총 21,? (ITM 용도 × 승용)
+        자가용: 0.9382
+        영업용: 0.0601
+        관용: 0.0017
+        source: KOSIS DT_MLTM_1244 2024 (ITM 용도 × 승용)
+        note: 규모별(경/소/중/대)은 KOSIS에 없음(국토부 월보 전용). 차종·용도가 보험엔 더 적합.
+  # 심도 소규모(26,639): credibility shrinkage / 계층모델
+  credibility:
+    enabled: false
+    method: buhlmann_straub   # buhlmann_straub | hierarchical
+    group_col: VehBrand       # 신뢰도 풀링 그룹
+    # complement: 큰 풀 평균(전체 평균 심도) 또는 인플레 보정 전년 추정치

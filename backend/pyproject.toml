@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-insurance-diagnosis"
+version = "0.1.0"
+description = "개인 리스크(빈도×심도) 예측 → 적정 보장·보험료 진단/추천"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "scripts", "app", "tests"]
+
+[tool.ruff.lint]
+# E,F=pyflakes/pycodestyle, I=isort, UP=pyupgrade, B=bugbear
+select = ["E", "F", "I", "UP", "B"]
+# E402: 스크립트/앱은 sys.path 주입 후 import (의도적). 라인별 noqa 로 표기됨.
+ignore = ["E501"]   # 줄길이는 line-length 로만 관리
